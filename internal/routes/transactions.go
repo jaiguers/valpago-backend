@@ -3,6 +3,7 @@ package routes
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -33,16 +34,16 @@ type Transaction struct {
 
 // Estructura para recibir datos en español
 type CreateTransactionRequestSpanish struct {
-	MetodoPago         string  `json:"metodo_pago" validate:"required"`
-	Monto              float64 `json:"monto" validate:"required,gt=0"`
-	CuentaConsignacion string  `json:"cuenta_consignación" validate:"required"`
-	Referencia         string  `json:"referencia" validate:"required"`
-	CuentaOrigen       string  `json:"cuenta_origen" validate:"required"`
-	Beneficiario       string  `json:"beneficiario" validate:"required"`
-	TelWhatsappSend    string  `json:"tel_whatsapp_send" validate:"required"`
-	Estado             string  `json:"estado" validate:"required"`
-	URLSoport          string  `json:"url_soport" validate:"required"`
-	Date               string  `json:"date" validate:"required"`
+	MetodoPago         string `json:"metodo_pago" validate:"required"`
+	Monto              string `json:"monto" validate:"required"`
+	CuentaConsignacion string `json:"cuenta_consignacion" validate:"required"`
+	Referencia         string `json:"referencia" validate:"required"`
+	CuentaOrigen       string `json:"cuenta_origen" validate:"required"`
+	Beneficiario       string `json:"beneficiario" validate:"required"`
+	TelWhatsappSend    string `json:"tel_whatsapp_send" validate:"required"`
+	Estado             string `json:"estado" validate:"required"`
+	URLSoport          string `json:"url_soporte" validate:"required"`
+	Date               string `json:"date" validate:"required"`
 }
 
 // Estructura para almacenar en inglés (estructura interna)
@@ -65,11 +66,17 @@ type UpdateStatusRequest struct {
 }
 
 // Función para mapear de español a inglés
-func mapSpanishToEnglish(spanish CreateTransactionRequestSpanish, userID string) CreateTransactionRequest {
+func mapSpanishToEnglish(spanish CreateTransactionRequestSpanish, userID string) (CreateTransactionRequest, error) {
+	// Parsear monto de string a float64
+	amount, err := strconv.ParseFloat(spanish.Monto, 64)
+	if err != nil {
+		return CreateTransactionRequest{}, fmt.Errorf("invalid amount format: %v", err)
+	}
+
 	return CreateTransactionRequest{
 		UserID:             userID,
 		PaymentMethod:      spanish.MetodoPago,
-		Amount:             spanish.Monto,
+		Amount:             amount,
 		DestinationAccount: spanish.CuentaConsignacion,
 		Reference:          spanish.Referencia,
 		SourceAccount:      spanish.CuentaOrigen,
@@ -78,7 +85,7 @@ func mapSpanishToEnglish(spanish CreateTransactionRequestSpanish, userID string)
 		Status:             spanish.Estado,
 		SupportURL:         spanish.URLSoport,
 		Date:               spanish.Date,
-	}
+	}, nil
 }
 
 func createTransaction(c echo.Context) error {
@@ -135,7 +142,10 @@ func createTransaction(c echo.Context) error {
 	fmt.Printf("User found: %s (%s)\n", user.Name, user.Email)
 
 	// Mapear de español a inglés
-	req := mapSpanishToEnglish(spanishReq, userID)
+	req, err := mapSpanishToEnglish(spanishReq, userID)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 
 	// Create transaction
 	transaction := Transaction{
