@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -27,8 +28,8 @@ func Start() {
 
 	// Create consumer group if it doesn't exist
 	err := db.Rdb.XGroupCreateMkStream(ctx, streamName, groupName, "0").Err()
-	if err != nil {
-		log.Printf("Error creating consumer group: %v", err)
+	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+		log.Printf("Error creating consumer group %s for stream %s: %v", groupName, streamName, err)
 	}
 
 	for {
@@ -69,22 +70,28 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 	// Simulate processing time
 	time.Sleep(time.Second * 2)
 
-	// Update transaction status to REVIEW
-	transactionID := message.Values["transaction_id"]
-	if transactionID != nil {
-		// In a real implementation, you would update the MongoDB transaction
-		// and send notifications via SSE
-		log.Printf("Transaction %s processed, status updated to REVIEW", transactionID)
-
-		// Send notification to SSE stream
-		notificationData := map[string]interface{}{
-			"transaction_id": transactionID,
-			"status":         "REVIEW",
-			"timestamp":      time.Now().Unix(),
+	// Notificar al front solo los PENDING (para que aparezcan en la cola)
+	if raw, ok := message.Values["data"]; ok {
+		payload := fmt.Sprintf("%v", raw)
+		notification := map[string]interface{}{
+			"type":      "transaction.pending",
+			"data":      payload,
+			"timestamp": time.Now().Unix(),
 		}
 		db.Rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: "valpago:notifications",
-			Values: notificationData,
+			Stream: config.C.RedisNotificationsStream,
+			Values: notification,
 		})
+		return
 	}
+
+	// Fallback: publicar evento mínimo si no hay "data"
+	notificationData := map[string]interface{}{
+		"status":    "REVIEW",
+		"timestamp": time.Now().Unix(),
+	}
+	db.Rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: config.C.RedisNotificationsStream,
+		Values: notificationData,
+	})
 }

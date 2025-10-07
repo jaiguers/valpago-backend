@@ -8,10 +8,10 @@ use crate::{errors::{ApiError, ApiResult}, routes::AppState, security::{apikey::
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TransactionStatus {
-    PENDING,
-    REVIEW,
-    APPROVED,
-    REJECTED,
+    PENDING="pending",
+    REVIEW="review",
+    APPROVED="approved",
+    REJECTED="rejected",
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 
+	"github.com/usuario/valpago-backend/internal/config"
 	"github.com/usuario/valpago-backend/internal/db"
 )
 
@@ -62,7 +64,7 @@ type CreateTransactionRequest struct {
 }
 
 type UpdateStatusRequest struct {
-	Status string `json:"status" validate:"required,oneof=PENDING REVIEW APPROVED REJECTED"`
+	Status string `json:"status" validate:"required,oneof=pending review approved rejected"`
 }
 
 // Función para mapear de español a inglés
@@ -109,10 +111,6 @@ func createTransaction(c echo.Context) error {
 	if userID == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "User ID required in header"})
 	}
-
-	// Log para debug
-	fmt.Printf("Received user-id: '%s'\n", userID)
-	fmt.Printf("User-id length: %d\n", len(userID))
 
 	// Verificar que el usuario existe
 	userObjectID, err := primitive.ObjectIDFromHex(userID)
@@ -171,26 +169,45 @@ func createTransaction(c echo.Context) error {
 
 	transaction.ID = result.InsertedID.(primitive.ObjectID)
 
-	// Send to Redis stream for processing
+	// Inicializar estado en Redis: pending (si Redis disponible)
 	if db.Rdb != nil {
-		streamData := map[string]interface{}{
-			"transaction_id": transaction.ID.Hex(),
-			"user_id":        transaction.UserID,
-			"amount":         transaction.Amount,
-			"status":         transaction.Status,
-			"timestamp":      time.Now().Unix(),
+		statusKey := fmt.Sprintf("tx:%s:status", transaction.ID.Hex())
+		_ = db.Rdb.SetNX(c.Request().Context(), statusKey, "pending", 0).Err()
+	}
+
+	// Publicar en Redis Stream (procesamiento) el objeto completo como JSON
+	if db.Rdb != nil {
+		payloadBytes, _ := json.Marshal(transaction)
+		processing := map[string]interface{}{
+			"type":      "transaction.created",
+			"data":      string(payloadBytes),
+			"timestamp": time.Now().Unix(),
 		}
-		db.Rdb.XAdd(c.Request().Context(), &redis.XAddArgs{
-			Stream: "valpago:transactions",
-			Values: streamData,
-		})
+		stream := config.C.RedisStreamNS
+		if stream == "" {
+			stream = "valpago:transactions"
+		}
+
+		err := db.Rdb.XAdd(c.Request().Context(), &redis.XAddArgs{
+			Stream: stream,
+			Values: processing,
+		}).Err()
+		if err != nil {
+			strError := fmt.Sprintf("Error XAdd: %v", err)
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": strError})
+		}
+
+		// No notificar al front aquí; el worker será quien publique los PENDING
 	}
 
 	return c.JSON(http.StatusCreated, transaction)
 }
 
 func listTransactions(c echo.Context) error {
-	cursor, err := db.Mongo().Collection("transactions").Find(c.Request().Context(), bson.M{})
+	// Filtrar solo transacciones con estado PENDING
+	filter := bson.M{"status": "pending"}
+
+	cursor, err := db.Mongo().Collection("transactions").Find(c.Request().Context(), filter)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to fetch transactions"})
 	}
@@ -249,4 +266,199 @@ func updateTransactionStatus(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction status updated successfully"})
+}
+
+// reviewTransaction: mueve estado de pending -> review de forma atómica y notifica
+func reviewTransaction(c echo.Context) error {
+
+	idStr := c.Param("id")
+	if _, err := primitive.ObjectIDFromHex(idStr); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid transaction ID"})
+	}
+
+	if db.Rdb == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "Redis unavailable"})
+	}
+
+	ctx := c.Request().Context()
+	statusKey := fmt.Sprintf("tx:%s:status", idStr)
+
+	// Lua para hacer CAS pending->review
+	script := redis.NewScript(`
+		local k = KEYS[1]
+		local cur = redis.call('GET', k)
+		if cur == false then return 'NOT_FOUND' end
+		if cur ~= 'pending' then return cur end
+		redis.call('SET', k, 'review')
+		return 'OK'
+	`)
+	res, err := script.Run(ctx, db.Rdb, []string{statusKey}).Result()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Redis error"})
+	}
+	if s, _ := res.(string); s != "OK" {
+		if s == "NOT_FOUND" {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "Status not found"})
+		}
+		return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("Invalid state: %s", s)})
+	}
+
+	// Actualizar Mongo a REVIEW y cargar objeto para notificar
+	var tx Transaction
+	objID, _ := primitive.ObjectIDFromHex(idStr)
+	if _, err := db.Mongo().Collection("transactions").UpdateOne(
+		ctx,
+		bson.M{"_id": objID},
+		bson.M{"$set": bson.M{"status": "review", "updatedAt": time.Now()}},
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to update transaction in Mongo"})
+	}
+	if err := db.Mongo().Collection("transactions").FindOne(ctx, bson.M{"_id": objID}).Decode(&tx); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to load transaction"})
+	}
+	payloadBytes, _ := json.Marshal(tx)
+
+	// Publicar notificación review
+	if db.Rdb != nil {
+		notification := map[string]interface{}{
+			"type":      "transaction.review",
+			"data":      string(payloadBytes),
+			"timestamp": time.Now().Unix(),
+		}
+		notifStream := config.C.RedisNotificationsStream
+		if notifStream == "" {
+			notifStream = "valpago:notifications"
+		}
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: notifStream, Values: notification})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction moved to review"})
+}
+
+// approveTransaction: mueve estado de review -> approved y notifica
+func approveTransaction(c echo.Context) error {
+	idStr := c.Param("id")
+	if _, err := primitive.ObjectIDFromHex(idStr); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid transaction ID"})
+	}
+
+	if db.Rdb == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "Redis unavailable"})
+	}
+
+	ctx := c.Request().Context()
+	statusKey := fmt.Sprintf("tx:%s:status", idStr)
+
+	script := redis.NewScript(`
+		local k = KEYS[1]
+		local cur = redis.call('GET', k)
+		if cur == false then return 'NOT_FOUND' end
+		if cur ~= 'review' then return cur end
+		redis.call('SET', k, 'approved')
+		return 'OK'
+	`)
+	res, err := script.Run(ctx, db.Rdb, []string{statusKey}).Result()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Redis error"})
+	}
+	if s, _ := res.(string); s != "OK" {
+		if s == "NOT_FOUND" {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "Status not found"})
+		}
+		return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("Invalid state: %s", s)})
+	}
+
+	// Actualizar Mongo a APPROVED y cargar objeto para notificar
+	var tx Transaction
+	objID, _ := primitive.ObjectIDFromHex(idStr)
+	if _, err := db.Mongo().Collection("transactions").UpdateOne(
+		ctx,
+		bson.M{"_id": objID},
+		bson.M{"$set": bson.M{"status": "APPROVED", "updatedAt": time.Now()}},
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to update transaction in Mongo"})
+	}
+	if err := db.Mongo().Collection("transactions").FindOne(ctx, bson.M{"_id": objID}).Decode(&tx); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to load transaction"})
+	}
+	payloadBytes, _ := json.Marshal(tx)
+
+	if db.Rdb != nil {
+		notification := map[string]interface{}{
+			"type":      "transaction.approved",
+			"data":      string(payloadBytes),
+			"timestamp": time.Now().Unix(),
+		}
+		notifStream := config.C.RedisNotificationsStream
+		if notifStream == "" {
+			notifStream = "valpago:notifications"
+		}
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: notifStream, Values: notification})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction approved"})
+}
+
+// rejectTransaction: mueve estado de review -> rejected y notifica, actualiza Mongo
+func rejectTransaction(c echo.Context) error {
+	idStr := c.Param("id")
+	if _, err := primitive.ObjectIDFromHex(idStr); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid transaction ID"})
+	}
+
+	if db.Rdb == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "Redis unavailable"})
+	}
+
+	ctx := c.Request().Context()
+	statusKey := fmt.Sprintf("tx:%s:status", idStr)
+
+	script := redis.NewScript(`
+        local k = KEYS[1]
+        local cur = redis.call('GET', k)
+        if cur == false then return 'NOT_FOUND' end
+        if cur ~= 'review' then return cur end
+        redis.call('SET', k, 'rejected')
+        return 'OK'
+    `)
+	res, err := script.Run(ctx, db.Rdb, []string{statusKey}).Result()
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Redis error"})
+	}
+	if s, _ := res.(string); s != "OK" {
+		if s == "NOT_FOUND" {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "Status not found"})
+		}
+		return c.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("Invalid state: %s", s)})
+	}
+
+	// Actualizar Mongo a REJECTED y cargar objeto para notificar
+	var tx Transaction
+	objID, _ := primitive.ObjectIDFromHex(idStr)
+	if _, err := db.Mongo().Collection("transactions").UpdateOne(
+		ctx,
+		bson.M{"_id": objID},
+		bson.M{"$set": bson.M{"status": "rejected", "updatedAt": time.Now()}},
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to update transaction in Mongo"})
+	}
+	if err := db.Mongo().Collection("transactions").FindOne(ctx, bson.M{"_id": objID}).Decode(&tx); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to load transaction"})
+	}
+	payloadBytes, _ := json.Marshal(tx)
+
+	if db.Rdb != nil {
+		notification := map[string]interface{}{
+			"type":      "transaction.rejected",
+			"data":      string(payloadBytes),
+			"timestamp": time.Now().Unix(),
+		}
+		notifStream := config.C.RedisNotificationsStream
+		if notifStream == "" {
+			notifStream = "valpago:notifications"
+		}
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: notifStream, Values: notification})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction rejected"})
 }

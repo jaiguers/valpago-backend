@@ -2,8 +2,7 @@ package db
 
 import (
 	"context"
-	"crypto/tls"
-	"strings"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,18 +11,13 @@ import (
 var Rdb *redis.Client
 
 func ConnectRedis(url string) error {
+	fmt.Printf("Connecting to Redis: %s\n", url)
+
 	// Parse the Redis URL directly
 	opt, err := redis.ParseURL(url)
 	if err != nil {
+		fmt.Printf("Error parsing Redis URL: %v\n", err)
 		return err
-	}
-
-	// If it's a TLS connection (rediss://), configure TLS
-	if strings.HasPrefix(url, "rediss://") {
-		opt.TLSConfig = &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: false,
-		}
 	}
 
 	Rdb = redis.NewClient(opt)
@@ -32,5 +26,11 @@ func ConnectRedis(url string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	return Rdb.Ping(ctx).Err()
+	// Test the connection
+	if err := Rdb.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("redis ping failed: %w", err)
+	}
+
+	fmt.Println("Redis connected successfully")
+	return nil
 }

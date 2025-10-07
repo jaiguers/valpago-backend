@@ -5,10 +5,10 @@
 #include <bsoncxx/oid.hpp>
 
 enum class TransactionStatus {
-    PENDING,
-    REVIEW,
-    APPROVED,
-    REJECTED
+    PENDING = "pending",
+    REVIEW = "review",
+    APPROVED = "approved",
+    REJECTED = "rejected"
 };
 
 struct User {

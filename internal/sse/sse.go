@@ -28,27 +28,20 @@ func handleSSE(c echo.Context) error {
 	messageChan := make(chan string, 10)
 	defer close(messageChan)
 
-	// Start Redis stream consumer in a goroutine
+	// Start Redis stream consumer (broadcast) in a goroutine
 	go func() {
 		ctx := context.Background()
-		
-		// Create consumer group if it doesn't exist
-		groupName := config.C.RedisGroup
-		streamName := config.C.RedisStreamNS
-		consumerName := fmt.Sprintf("%s-%d", config.C.RedisConsumer, time.Now().Unix())
 
-		// Try to create consumer group (ignore error if it already exists)
-		db.Rdb.XGroupCreateMkStream(ctx, streamName, groupName, "0")
+		streamName := config.C.RedisNotificationsStream
+		lastID := "$" // empezar desde nuevos mensajes
 
 		for {
-		// Read from Redis stream
-		streams, err := db.Rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    groupName,
-			Consumer: consumerName,
-			Streams:  []string{streamName, ">"},
-			Count:    1,
-			Block:    time.Second * 5,
-		}).Result()
+			// Read from Redis stream (XREAD broadcast)
+			streams, err := db.Rdb.XRead(ctx, &redis.XReadArgs{
+				Streams: []string{streamName, lastID},
+				Count:   10,
+				Block:   time.Second * 5,
+			}).Result()
 
 			if err != nil {
 				if err == redis.Nil {
@@ -61,13 +54,20 @@ func handleSSE(c echo.Context) error {
 
 			for _, stream := range streams {
 				for _, message := range stream.Messages {
-					// Format message for SSE
-					data := fmt.Sprintf("data: %s\n\n", message.Values["status"])
+					// Preferir el JSON completo si viene en "data"; si no, construir uno simple
+					var payload string
+					if raw, ok := message.Values["data"]; ok {
+						payload = fmt.Sprintf("%v", raw)
+					} else {
+						payload = fmt.Sprintf(`{"status":"%v"}`, message.Values["status"])
+					}
+					data := fmt.Sprintf("data: %s\n\n", payload)
 					select {
 					case messageChan <- data:
 					default:
 						// Channel full, skip message
 					}
+					lastID = message.ID
 				}
 			}
 		}
