@@ -157,7 +157,7 @@ src/
 - **Stream**: `valpago:transactions`
 - **Consumer Group**: `valpago:cg`
 - **Worker**: Procesa mensajes y envía notificaciones SSE
-- **Estados**: `PENDING` → `REVIEW` → `APPROVED`/`REJECTED`
+- **Estados**: `pending` → `review` → `approved`/`rejected`
 
 ## Desarrollo
 

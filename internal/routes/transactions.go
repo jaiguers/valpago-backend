@@ -270,7 +270,6 @@ func updateTransactionStatus(c echo.Context) error {
 
 // reviewTransaction: mueve estado de pending -> review de forma atómica y notifica
 func reviewTransaction(c echo.Context) error {
-
 	idStr := c.Param("id")
 	if _, err := primitive.ObjectIDFromHex(idStr); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid transaction ID"})
@@ -318,18 +317,18 @@ func reviewTransaction(c echo.Context) error {
 	}
 	payloadBytes, _ := json.Marshal(tx)
 
-	// Publicar notificación review
+	// Publicar evento de estado al stream de procesamiento para que el worker lo maneje
 	if db.Rdb != nil {
-		notification := map[string]interface{}{
+		stateEvent := map[string]interface{}{
 			"type":      "transaction.review",
 			"data":      string(payloadBytes),
 			"timestamp": time.Now().Unix(),
 		}
-		notifStream := config.C.RedisNotificationsStream
-		if notifStream == "" {
-			notifStream = "valpago:notifications"
+		stream := config.C.RedisStreamNS
+		if stream == "" {
+			stream = "valpago:transactions"
 		}
-		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: notifStream, Values: notification})
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: stateEvent})
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction moved to review"})
@@ -374,7 +373,7 @@ func approveTransaction(c echo.Context) error {
 	if _, err := db.Mongo().Collection("transactions").UpdateOne(
 		ctx,
 		bson.M{"_id": objID},
-		bson.M{"$set": bson.M{"status": "APPROVED", "updatedAt": time.Now()}},
+		bson.M{"$set": bson.M{"status": "approved", "updatedAt": time.Now()}},
 	); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to update transaction in Mongo"})
 	}
@@ -383,17 +382,18 @@ func approveTransaction(c echo.Context) error {
 	}
 	payloadBytes, _ := json.Marshal(tx)
 
+	// Publicar evento de estado al stream de procesamiento para que el worker lo maneje
 	if db.Rdb != nil {
-		notification := map[string]interface{}{
+		stateEvent := map[string]interface{}{
 			"type":      "transaction.approved",
 			"data":      string(payloadBytes),
 			"timestamp": time.Now().Unix(),
 		}
-		notifStream := config.C.RedisNotificationsStream
-		if notifStream == "" {
-			notifStream = "valpago:notifications"
+		stream := config.C.RedisStreamNS
+		if stream == "" {
+			stream = "valpago:transactions"
 		}
-		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: notifStream, Values: notification})
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: stateEvent})
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction approved"})
@@ -447,17 +447,18 @@ func rejectTransaction(c echo.Context) error {
 	}
 	payloadBytes, _ := json.Marshal(tx)
 
+	// Publicar evento de estado al stream de procesamiento para que el worker lo maneje
 	if db.Rdb != nil {
-		notification := map[string]interface{}{
+		stateEvent := map[string]interface{}{
 			"type":      "transaction.rejected",
 			"data":      string(payloadBytes),
 			"timestamp": time.Now().Unix(),
 		}
-		notifStream := config.C.RedisNotificationsStream
-		if notifStream == "" {
-			notifStream = "valpago:notifications"
+		stream := config.C.RedisStreamNS
+		if stream == "" {
+			stream = "valpago:transactions"
 		}
-		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: notifStream, Values: notification})
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: stateEvent})
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction rejected"})

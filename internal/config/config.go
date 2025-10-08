@@ -19,6 +19,12 @@ type Config struct {
 	APIKeyHeader             string
 	ServerPort               int
 	AllowedOrigins           string
+	// External services
+	BearerTokenMeta    string
+	SupabaseProject    string
+	SupabaseBucket     string
+	SupabaseURLProject string
+	SupabaseAPIKey     string
 }
 
 var C Config
@@ -39,6 +45,12 @@ func Load() error {
 	C.APIKeyHeader = getenv("API_KEY_HEADER_NAME", "x-api-key")
 	C.ServerPort = getenvInt("SERVER_PORT", 8080)
 	C.AllowedOrigins = getenv("ALLOWED_ORIGINS", "*")
+	// External services
+	C.BearerTokenMeta = getenv("BEARER_TOKEN_FACE", "")
+	C.SupabaseProject = getenv("SUPABASE_PROJECT", "")
+	C.SupabaseBucket = getenv("SUPABASE_BUCKET", "")
+	C.SupabaseURLProject = getenv("SUPABASE_URL_PROJECT", "")
+	C.SupabaseAPIKey = getenv("SUPABASE_API_KEY", "")
 	return nil
 }
 

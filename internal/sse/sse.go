@@ -26,16 +26,24 @@ func handleSSE(c echo.Context) error {
 
 	// Create a channel to send messages
 	messageChan := make(chan string, 10)
-	defer close(messageChan)
+
+	// Use a cancellable context tied to the request
+	ctx, cancel := context.WithCancel(c.Request().Context())
+	defer cancel()
 
 	// Start Redis stream consumer (broadcast) in a goroutine
 	go func() {
-		ctx := context.Background()
 
 		streamName := config.C.RedisNotificationsStream
 		lastID := "$" // empezar desde nuevos mensajes
 
 		for {
+			// Stop if client disconnected
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			// Read from Redis stream (XREAD broadcast)
 			streams, err := db.Rdb.XRead(ctx, &redis.XReadArgs{
 				Streams: []string{streamName, lastID},
@@ -47,6 +55,10 @@ func handleSSE(c echo.Context) error {
 				if err == redis.Nil {
 					// No messages, continue
 					continue
+				}
+				// If context was cancelled, exit
+				if ctx.Err() != nil {
+					return
 				}
 				fmt.Printf("Redis stream error: %v\n", err)
 				continue
@@ -82,6 +94,8 @@ func handleSSE(c echo.Context) error {
 			}
 			c.Response().Flush()
 		case <-c.Request().Context().Done():
+			// Ensure goroutine stops
+			cancel()
 			return nil
 		}
 	}

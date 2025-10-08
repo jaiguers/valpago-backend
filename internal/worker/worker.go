@@ -1,13 +1,22 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	"github.com/usuario/valpago-backend/internal/config"
 	"github.com/usuario/valpago-backend/internal/db"
@@ -72,9 +81,60 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 
 	// Notificar al front solo los PENDING (para que aparezcan en la cola)
 	if raw, ok := message.Values["data"]; ok {
-		payload := fmt.Sprintf("%v", raw)
+		originalJSON := fmt.Sprintf("%v", raw)
+
+		// 1) Intentar descargar imagen de Meta y subir a Supabase
+		uploadedURL, err := fetchAndUploadSupportImage(ctx, originalJSON)
+		if err != nil {
+			log.Printf("support image handling error: %v", err)
+		}
+
+		// 2) Si tenemos URL subida, actualizar primero en Mongo
+		var finalJSON string = originalJSON
+		if uploadedURL != "" {
+			idStr, idErr := extractIdFromTransactionJSON(originalJSON)
+			if idErr != nil {
+				log.Printf("failed to extract id: %v", idErr)
+			} else {
+				if err := setMongoSupportURL(ctx, idStr, uploadedURL); err != nil {
+					log.Printf("failed to update Mongo support_url: %v", err)
+				} else {
+					// 3) Recargar la transacción desde Mongo y usar ese JSON actualizado para notificar
+					var txDoc map[string]interface{}
+					oid, _ := primitive.ObjectIDFromHex(idStr)
+					if err := db.Mongo().Collection("transactions").FindOne(ctx, bson.M{"_id": oid}).Decode(&txDoc); err == nil {
+						if b, mErr := json.Marshal(txDoc); mErr == nil {
+							finalJSON = string(b)
+						}
+					}
+				}
+			}
+		}
+
+		// 4) Publicar notificación PENDING con el JSON final (ya con support_url de Supabase si se logró subir)
 		notification := map[string]interface{}{
 			"type":      "transaction.pending",
+			"data":      finalJSON,
+			"timestamp": time.Now().Unix(),
+		}
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: config.C.RedisNotificationsStream,
+			Values: notification,
+		})
+		return
+	}
+
+	// Manejar otros tipos de eventos (review, approved, rejected)
+	if eventType, ok := message.Values["type"]; ok {
+		eventTypeStr := fmt.Sprintf("%v", eventType)
+		payload := ""
+		if raw, hasData := message.Values["data"]; hasData {
+			payload = fmt.Sprintf("%v", raw)
+		}
+
+		// Notificar al front según el tipo de evento
+		notification := map[string]interface{}{
+			"type":      eventTypeStr,
 			"data":      payload,
 			"timestamp": time.Now().Unix(),
 		}
@@ -87,11 +147,158 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 
 	// Fallback: publicar evento mínimo si no hay "data"
 	notificationData := map[string]interface{}{
-		"status":    "REVIEW",
+		"status":    "review",
 		"timestamp": time.Now().Unix(),
 	}
 	db.Rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: config.C.RedisNotificationsStream,
 		Values: notificationData,
 	})
+}
+
+// fetchAndUploadSupportImage intenta descargar la imagen desde Meta con Bearer y subirla a Supabase; si falla, usa imagen local
+func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (string, error) {
+	// Extraer support_url del JSON (búsqueda simple para evitar dependencia de structs)
+	// Se asume que el campo es: "support_url":"<url>"
+	idx := strings.Index(transactionJSON, "\"support_url\":\"")
+	if idx == -1 {
+		return "", fmt.Errorf("support_url not found in payload")
+	}
+	start := idx + len("\"support_url\":\"")
+	end := strings.Index(transactionJSON[start:], "\"")
+	if end == -1 {
+		return "", fmt.Errorf("malformed support_url in payload")
+	}
+	supportURL := transactionJSON[start : start+end]
+
+	// Descargar con Bearer
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, supportURL, nil)
+	if err != nil {
+		return fallbackUpload(ctx)
+	}
+	if config.C.BearerTokenMeta != "" {
+		req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return fallbackUpload(ctx)
+	}
+	defer resp.Body.Close()
+
+	// Asegurar que es imagen
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		// intentar detectar por algunos bytes
+		peek := make([]byte, 512)
+		n, _ := io.ReadFull(resp.Body, peek)
+		contentType = http.DetectContentType(peek[:n])
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek[:n]), resp.Body))
+	}
+	if !strings.HasPrefix(contentType, "image/") {
+		return fallbackUpload(ctx)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fallbackUpload(ctx)
+	}
+
+	// Nombre y extensión
+	ext := ".jpeg"
+	if exts, _ := mime.ExtensionsByType(contentType); len(exts) > 0 {
+		ext = exts[0]
+	}
+	fileName := fmt.Sprintf("evidence_%d%s", time.Now().UnixNano(), ext)
+
+	// Subir a Supabase
+	url, err := uploadToSupabase(ctx, fileName, data, contentType)
+	if err != nil {
+		return fallbackUpload(ctx)
+	}
+	return url, nil
+}
+
+func fallbackUpload(ctx context.Context) (string, error) {
+	// Ruta relativa: internal/worker/img/Comprobante-test.jpeg
+	wd, _ := os.Getwd()
+	path := filepath.Join(wd, "internal", "worker", "img", "Comprobante-test.jpeg")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return uploadToSupabase(ctx, fmt.Sprintf("fallback_%d.jpeg", time.Now().UnixNano()), data, "image/jpeg")
+}
+
+func uploadToSupabase(ctx context.Context, name string, data []byte, contentType string) (string, error) {
+	if config.C.SupabaseURLProject == "" || config.C.SupabaseBucket == "" || config.C.SupabaseAPIKey == "" {
+		return "", fmt.Errorf("supabase env missing")
+	}
+	// Endpoint de Storage: POST /storage/v1/object/{bucket}/{path}
+	url := fmt.Sprintf("%s/storage/v1/object/%s/%s", strings.TrimRight(config.C.SupabaseURLProject, "/"), config.C.SupabaseBucket, name)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+config.C.SupabaseAPIKey)
+	req.Header.Set("apikey", config.C.SupabaseAPIKey)
+	req.Header.Set("Content-Type", contentType)
+	// Preferir URL pública
+	req.Header.Set("x-upsert", "true")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("supabase upload failed: %s", string(body))
+	}
+
+	// Construir URL pública: {project}/storage/v1/object/public/{bucket}/{name}
+	publicURL := fmt.Sprintf("%s/storage/v1/object/public/%s/%s", strings.TrimRight(config.C.SupabaseURLProject, "/"), config.C.SupabaseBucket, name)
+	return publicURL, nil
+}
+
+func extractIdFromTransactionJSON(transactionJSON string) (string, error) {
+	// Intenta ambos formatos
+	if strings.Contains(transactionJSON, "\"id\":{") {
+		idx := strings.Index(transactionJSON, "\"id\":{")
+		start := strings.Index(transactionJSON[idx:], "\"$oid\":\"")
+		if start == -1 {
+			return "", fmt.Errorf("$oid not found in id")
+		}
+		start = idx + start + len("\"$oid\":\"")
+		end := strings.Index(transactionJSON[start:], "\"")
+		if end == -1 {
+			return "", fmt.Errorf("malformed $oid")
+		}
+		return transactionJSON[start : start+end], nil
+	}
+	idx := strings.Index(transactionJSON, "\"id\":\"")
+	if idx == -1 {
+		return "", fmt.Errorf("id not found")
+	}
+	start := idx + len("\"id\":\"")
+	end := strings.Index(transactionJSON[start:], "\"")
+	if end == -1 {
+		return "", fmt.Errorf("malformed id")
+	}
+	return transactionJSON[start : start+end], nil
+}
+
+func setMongoSupportURL(ctx context.Context, idHex string, uploadedURL string) error {
+	oid, err := primitive.ObjectIDFromHex(idHex)
+	if err != nil {
+		return err
+	}
+	_, err = db.Mongo().Collection("transactions").UpdateOne(
+		ctx,
+		bson.M{"_id": oid},
+		bson.M{"$set": bson.M{"support_url": uploadedURL, "updatedAt": time.Now()}},
+	)
+	return err
 }
