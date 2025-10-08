@@ -24,4 +24,11 @@ func Register(e *echo.Echo) {
 	api.PUT("/transactions/:id/review", reviewTransaction)
 	api.PUT("/transactions/:id/approve", approveTransaction)
 	api.PUT("/transactions/:id/reject", rejectTransaction)
+
+	// Merchants routes
+	api.POST("/merchants", CreateMerchant)
+	api.GET("/merchants", ListMerchants)
+	api.GET("/merchants/:id", GetMerchant)
+	api.PUT("/merchants/:id", UpdateMerchant)
+	api.DELETE("/merchants/:id", DeleteMerchant)
 }
