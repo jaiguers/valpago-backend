@@ -171,18 +171,31 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 	}
 	supportURL := transactionJSON[start : start+end]
 
-	// Descargar con Bearer
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, supportURL, nil)
+	// Extraer mid de la URL de WhatsApp
+	mid, err := extractMidFromWhatsAppURL(supportURL)
+	if err != nil {
+		log.Printf("Error extracting mid from WhatsApp URL: %v", err)
+		return fallbackUpload(ctx)
+	}
+
+	// Obtener URL real de la imagen desde Graph API
+	realImageURL, err := getRealImageURLFromMeta(ctx, mid)
+	if err != nil {
+		log.Printf("Error getting real image URL from Meta: %v", err)
+		return fallbackUpload(ctx)
+	}
+	log.Println(realImageURL, "realImageURL para descargar")
+	// Descargar imagen real con Bearer
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realImageURL, nil)
 	if err != nil {
 		return fallbackUpload(ctx)
 	}
+	log.Println(config.C.BearerTokenMeta, "TOKEN META")
 	if config.C.BearerTokenMeta != "" {
 		req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
 	}
-	log.Println(supportURL, "supportURL para ir al META")
+	log.Println(realImageURL, "realImageURL para descargar")
 	resp, err := http.DefaultClient.Do(req)
-	thisError := fmt.Sprintf("[******ERROR:******]%e", err)
-	log.Println(thisError)
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp != nil {
 			resp.Body.Close()
@@ -304,4 +317,60 @@ func setMongoSupportURL(ctx context.Context, idHex string, uploadedURL string) e
 		bson.M{"$set": bson.M{"support_url": uploadedURL, "updatedAt": time.Now()}},
 	)
 	return err
+}
+
+// extractMidFromWhatsAppURL extrae el parámetro mid de la URL de WhatsApp
+func extractMidFromWhatsAppURL(whatsappURL string) (string, error) {
+	// Buscar el parámetro mid en la URL
+	idx := strings.Index(whatsappURL, "mid=")
+	if idx == -1 {
+		return "", fmt.Errorf("mid parameter not found in WhatsApp URL")
+	}
+	start := idx + len("mid=")
+	end := strings.Index(whatsappURL[start:], "&")
+	if end == -1 {
+		// Si no hay & después de mid, tomar hasta el final
+		return whatsappURL[start:], nil
+	}
+	return whatsappURL[start : start+end], nil
+}
+
+// getRealImageURLFromMeta obtiene la URL real de la imagen desde Graph API de Meta
+func getRealImageURLFromMeta(ctx context.Context, mid string) (string, error) {
+	// Construir URL de Graph API
+	graphURL := fmt.Sprintf("https://graph.facebook.com/v18.0/%s", mid)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, graphURL, nil)
+	if err != nil {
+		return "[graph otro ERROR] " + err.Error(), err
+	}
+
+	if config.C.BearerTokenMeta != "" {
+		req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "[graph.facebook ERROR] " + err.Error(), err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("Graph API request failed with status: %d", resp.StatusCode)
+	}
+
+	// Parsear respuesta JSON
+	var response struct {
+		URL string `json:"url"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", err
+	}
+
+	if response.URL == "" {
+		return "", fmt.Errorf("empty URL in Graph API response")
+	}
+
+	return response.URL, nil
 }
