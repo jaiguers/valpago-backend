@@ -179,7 +179,10 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 	if config.C.BearerTokenMeta != "" {
 		req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
 	}
+	log.Println(supportURL, "supportURL para ir al META")
 	resp, err := http.DefaultClient.Do(req)
+	thisError := fmt.Sprintf("[******ERROR:******]%e", err)
+	log.Println(thisError)
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp != nil {
 			resp.Body.Close()
