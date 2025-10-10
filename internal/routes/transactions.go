@@ -1,8 +1,10 @@
 package routes
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -65,6 +67,11 @@ type CreateTransactionRequest struct {
 
 type UpdateStatusRequest struct {
 	Status string `json:"status" validate:"required,oneof=pending review approved rejected"`
+}
+
+type WebhookRequest struct {
+	Tel string `json:"tel"`
+	Msg string `json:"msg"`
 }
 
 // Función para mapear de español a inglés
@@ -396,6 +403,19 @@ func approveTransaction(c echo.Context) error {
 		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: stateEvent})
 	}
 
+	// Después de actualizar MongoDB y antes de publicar al stream:
+	var merchant Merchant
+	err = db.Mongo().Collection("merchants").FindOne(
+		ctx,
+		bson.M{"accounts": tx.DestinationAccount},
+	).Decode(&merchant)
+
+	if err == nil && merchant.Phone != "" {
+		// Si encontramos el merchant, enviamos la notificación
+		// Ignoramos cualquier error del webhook
+		_ = sendWebhookNotification(merchant.Phone, true)
+	}
+
 	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction approved"})
 }
 
@@ -461,5 +481,48 @@ func rejectTransaction(c echo.Context) error {
 		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: stateEvent})
 	}
 
+	// Después de actualizar MongoDB y antes de publicar al stream:
+	var merchant Merchant
+	err = db.Mongo().Collection("merchants").FindOne(
+		ctx,
+		bson.M{"accounts": tx.DestinationAccount},
+	).Decode(&merchant)
+
+	if err == nil && merchant.Phone != "" {
+		// Si encontramos el merchant, enviamos la notificación
+		// Ignoramos cualquier error del webhook
+		_ = sendWebhookNotification(merchant.Phone, false)
+	}
+
 	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction rejected"})
+}
+
+func sendWebhookNotification(phone string, isApproved bool) error {
+	webhookURL := "https://n8n.altabase.com.co/webhook/6dbb2967-a477-47c7-800c-febdecb0ba50"
+
+	msg := "🚨Comprobante no válido ❌❌❌⛓️‍💥📵"
+	if isApproved {
+		msg = "💲Transaccion aprobada ✅✅✅🧾"
+		log.Println("Transaction approved ✅✅✅, sending notification")
+	} else {
+		log.Println("Transaction rejected ❌❌❌, sending notification")
+	}
+
+	payload := WebhookRequest{
+		Tel: phone,
+		Msg: msg,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return nil
 }
