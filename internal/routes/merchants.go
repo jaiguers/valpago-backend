@@ -29,8 +29,8 @@ func CreateMerchant(c echo.Context) error {
 	}
 
 	// Validar campos requeridos (el ID lo genera el servidor)
-	if merchant.Responsible == "" || merchant.Name == "" || merchant.Phone == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing required fields: responsible, name, phone"})
+	if merchant.Responsible == "" || merchant.Name == "" || merchant.Phone == "" || merchant.Accounts == nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing required fields: responsible, name, phone, accounts"})
 	}
 
 	// Insertar en MongoDB
@@ -44,9 +44,10 @@ func CreateMerchant(c echo.Context) error {
 
 // UpdateMerchant actualiza un comercio existente
 func UpdateMerchant(c echo.Context) error {
-	merchantID := c.Param("id")
-	if merchantID == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Merchant ID is required"})
+	idStr := c.Param("id")
+	merchantID, err := primitive.ObjectIDFromHex(idStr)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid transaction ID"})
 	}
 
 	var merchant Merchant
@@ -55,14 +56,14 @@ func UpdateMerchant(c echo.Context) error {
 	}
 
 	// Validar campos requeridos
-	if merchant.Responsible == "" || merchant.Name == "" || merchant.Phone == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing required fields: responsible, name, phone"})
+	if merchant.Responsible == "" || merchant.Name == "" || merchant.Phone == "" || merchant.Accounts == nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing required fields: responsible, name, phone, accounts"})
 	}
 
 	// Actualizar en MongoDB
 	result, err := db.Mongo().Collection("merchants").UpdateOne(
 		c.Request().Context(),
-		bson.M{"id": merchantID},
+		bson.M{"_id": merchantID},
 		bson.M{"$set": bson.M{
 			"responsible": merchant.Responsible,
 			"name":        merchant.Name,
@@ -80,7 +81,7 @@ func UpdateMerchant(c echo.Context) error {
 
 	// Obtener el comercio actualizado
 	var updatedMerchant Merchant
-	err = db.Mongo().Collection("merchants").FindOne(c.Request().Context(), bson.M{"id": merchantID}).Decode(&updatedMerchant)
+	err = db.Mongo().Collection("merchants").FindOne(c.Request().Context(), bson.M{"_id": merchantID}).Decode(&updatedMerchant)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to retrieve updated merchant"})
 	}

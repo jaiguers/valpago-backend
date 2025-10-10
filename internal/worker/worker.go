@@ -171,20 +171,13 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 	}
 	supportURL := transactionJSON[start : start+end]
 
-	// Extraer mid de la URL de WhatsApp
-	/*mid, err := extractMidFromWhatsAppURL(supportURL)
-	if err != nil {
-		log.Printf("Error extracting mid from WhatsApp URL: %v", err)
-		return fallbackUpload(ctx)
-	}*/
-
 	// Obtener URL real de la imagen desde Graph API
 	realImageURL, err := getRealImageURLFromMeta(ctx, supportURL)
 	if err != nil {
 		log.Printf("Error getting real image URL from Meta: %v", err)
 		return fallbackUpload(ctx)
 	}
-	//log.Println(realImageURL, "realImageURL para descargar")
+
 	// Descargar imagen real con Bearer
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realImageURL, nil)
 	if err != nil {
@@ -194,7 +187,7 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 	if config.C.BearerTokenMeta != "" {
 		req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
 	}
-	log.Println(supportURL, "realImageURL para descargar")
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp != nil {
@@ -209,7 +202,7 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 
 	// Asegurar que es imagen
 	contentType := resp.Header.Get("Content-Type")
-	log.Println(contentType, "content type imagen")
+
 	if contentType == "" {
 		// intentar detectar por algunos bytes
 		peek := make([]byte, 512)
