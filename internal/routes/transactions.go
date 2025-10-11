@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -410,10 +411,15 @@ func approveTransaction(c echo.Context) error {
 		bson.M{"accounts": tx.DestinationAccount},
 	).Decode(&merchant)
 
+	log.Printf("Merchant lookup for Phone %s resulted in error: %v", merchant.Phone, err)
+
 	if err == nil && merchant.Phone != "" {
+		log.Printf("********-*Inicia envio de notificacion: %s", tx.DestinationAccount)
 		// Si encontramos el merchant, enviamos la notificación
 		// Ignoramos cualquier error del webhook
 		_ = sendWebhookNotification(merchant.Phone, true)
+	} else {
+		log.Printf("No merchant found for account: %s", tx.DestinationAccount)
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction approved"})
@@ -503,9 +509,6 @@ func sendWebhookNotification(phone string, isApproved bool) error {
 	msg := "🚨Comprobante no válido ❌❌❌⛓️‍💥📵"
 	if isApproved {
 		msg = "💲Transaccion aprobada ✅✅✅🧾"
-		log.Println("Transaction approved ✅✅✅, sending notification")
-	} else {
-		log.Println("Transaction rejected ❌❌❌, sending notification")
 	}
 
 	payload := WebhookRequest{
@@ -515,14 +518,24 @@ func sendWebhookNotification(phone string, isApproved bool) error {
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
+		log.Printf("Error marshaling webhook payload: %v", err)
 		return err
 	}
 
 	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
+		log.Printf("Error Post sending message webhook: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
+
+	// Leer y mostrar el body del response
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading response body: %v", err)
+	} else {
+		log.Printf("Webhook response body: %s", string(bodyBytes))
+	}
 
 	return nil
 }
