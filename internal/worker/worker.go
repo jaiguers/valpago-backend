@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -77,7 +78,7 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 	log.Printf("Processing transaction: %s", message.ID)
 
 	// Simulate processing time
-	time.Sleep(time.Second * 2)
+	// time.Sleep(time.Second * 2)
 
 	// Notificar al front solo los PENDING (para que aparezcan en la cola)
 	if raw, ok := message.Values["data"]; ok {
@@ -175,14 +176,14 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 	realImageURL, err := getRealImageURLFromMeta(ctx, supportURL)
 	if err != nil {
 		log.Printf("Error getting real image URL from Meta: %v", err)
-		return fallbackUpload(ctx)
+		return fallbackUpload()
 	}
 
 	// Descargar imagen real con Bearer
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realImageURL, nil)
 	if err != nil {
 		log.Println(err, "error NewRequestWithContext descargando imagen")
-		return fallbackUpload(ctx)
+		return fallbackUpload()
 	}
 	if config.C.BearerTokenMeta != "" {
 		req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
@@ -196,7 +197,7 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 		log.Println(err, "error DefaultClient.Do imagen")
 		log.Println(resp.StatusCode, "status code imagen")
 		log.Println(resp.Status, "status imagen")
-		return fallbackUpload(ctx)
+		return fallbackUpload()
 	}
 	defer resp.Body.Close()
 
@@ -212,13 +213,13 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 	}
 	if !strings.HasPrefix(contentType, "image/") {
 		log.Println(contentType, "content type imagen no es image/")
-		return fallbackUpload(ctx)
+		return fallbackUpload()
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Println(err, "error ReadAll imagen")
-		return fallbackUpload(ctx)
+		return fallbackUpload()
 	}
 
 	// Nombre y extensión
@@ -230,16 +231,17 @@ func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (st
 	log.Println(fileName, "fileName imagen")
 
 	// Subir a Supabase
-	url, err := uploadToSupabase(ctx, fileName, data, contentType)
+	/*url, err := uploadToSupabase(ctx, fileName, data, contentType)
 	if err != nil {
 		log.Println(err, "error uploadToSupabase imagen")
-		return fallbackUpload(ctx)
+		return fallbackUpload()
 	}
-	log.Println(url, "url fetchAndUploadSupportImage imagen")
+	log.Println(url, "url fetchAndUploadSupportImage imagen")*/
+	url := fmt.Sprintf("data:%s;base64,%s", "image/jpeg", base64.StdEncoding.EncodeToString(data))
 	return url, nil
 }
 
-func fallbackUpload(ctx context.Context) (string, error) {
+func fallbackUpload() (string, error) {
 	// Ruta relativa: internal/worker/img/Comprobante-test.jpeg
 	wd, _ := os.Getwd()
 	path := filepath.Join(wd, "internal", "worker", "img", "Comprobante-test.jpeg")
@@ -247,10 +249,12 @@ func fallbackUpload(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return uploadToSupabase(ctx, fmt.Sprintf("fallback_%d.jpeg", time.Now().UnixNano()), data, "image/jpeg")
+	// uploadToSupabase(ctx, fmt.Sprintf("fallback_%d.jpeg", time.Now().UnixNano()), data, "image/jpeg")
+	url := fmt.Sprintf("data:%s;base64,%s", "image/jpeg", base64.StdEncoding.EncodeToString(data))
+	return url, err
 }
 
-func uploadToSupabase(ctx context.Context, name string, data []byte, contentType string) (string, error) {
+/*func uploadToSupabase(ctx context.Context, name string, data []byte, contentType string) (string, error) {
 	if config.C.SupabaseURLProject == "" || config.C.SupabaseBucket == "" || config.C.SupabaseAPIKey == "" {
 		return "", fmt.Errorf("supabase env missing")
 	}
@@ -279,7 +283,7 @@ func uploadToSupabase(ctx context.Context, name string, data []byte, contentType
 	// Construir URL pública: {project}/storage/v1/object/public/{bucket}/{name}
 	publicURL := fmt.Sprintf("%s/storage/v1/object/public/%s/%s", strings.TrimRight(config.C.SupabaseURLProject, "/"), config.C.SupabaseBucket, name)
 	return publicURL, nil
-}
+}*/
 
 func extractIdFromTransactionJSON(transactionJSON string) (string, error) {
 	// Intenta ambos formatos
