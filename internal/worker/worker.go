@@ -1,23 +1,13 @@
 package worker
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"mime"
-	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	"github.com/usuario/valpago-backend/internal/config"
 	"github.com/usuario/valpago-backend/internal/db"
@@ -84,60 +74,21 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 	if raw, ok := message.Values["data"]; ok {
 		originalJSON := fmt.Sprintf("%v", raw)
 
-		// 1) Procesar imagen primero (síncrono, no en goroutine)
-		uploadedURL, err := fetchAndUploadSupportImage(ctx, originalJSON)
+		/*originalJSON, err := normalizeIdToUnderscoreId(originalJSON)
 		if err != nil {
-			log.Printf("support image handling error: %v", err)
-		}
-
-		// 2) Normalizar el JSON: convertir "id" a "_id" para que el frontend lo reciba correctamente
-		normalizedJSON, err := normalizeIdToUnderscoreId(originalJSON)
-		if err != nil {
-			log.Printf("Error normalizing JSON: %v", err)
-			normalizedJSON = originalJSON // Fallback al original
-		}
-
-		// 3) Parse normalizedJSON back to map to modify it
-		var jsonMap map[string]interface{}
-		if err := json.Unmarshal([]byte(normalizedJSON), &jsonMap); err != nil {
-			log.Printf("Error parsing JSON: %v", err)
+			log.Printf("Error normalizing ID: %v", err)
 			return
-		}
-
-		// 4) Add support_url to the map if image was uploaded
-		if uploadedURL != "" {
-			jsonMap["support_url"] = uploadedURL
-		}
-
-		// 5) Publicar notificación PENDING al SSE con support_url incluido (ANTES de actualizar MongoDB)
-		// Convertir jsonMap a JSON string para enviarlo correctamente
-		jsonBytes, err := json.Marshal(jsonMap)
-		if err != nil {
-			log.Printf("Error marshaling jsonMap: %v", err)
-			return
-		}
+		}*/
 
 		notification := map[string]interface{}{
 			"type":      "transaction.pending",
-			"data":      string(jsonBytes),
+			"data":      string(originalJSON),
 			"timestamp": time.Now().Unix(),
 		}
 		db.Rdb.XAdd(ctx, &redis.XAddArgs{
 			Stream: config.C.RedisNotificationsStream,
 			Values: notification,
 		})
-
-		// 6) Actualizar MongoDB con la URL de imagen DESPUÉS de publicar notificación
-		if uploadedURL != "" {
-			idStr, idErr := extractIdFromTransactionJSON(originalJSON)
-			if idErr != nil {
-				log.Printf("failed to extract id: %v", idErr)
-			} else {
-				if err := setMongoSupportURL(ctx, idStr, uploadedURL); err != nil {
-					log.Printf("failed to update Mongo support_url: %v", err)
-				}
-			}
-		}
 
 		return
 	}
@@ -175,90 +126,90 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 }
 
 // fetchAndUploadSupportImage intenta descargar la imagen desde Meta con Bearer y subirla a Supabase; si falla, usa imagen local
-func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (string, error) {
-	// Extraer support_url del JSON (búsqueda simple para evitar dependencia de structs)
-	// Se asume que el campo es: "support_url":"<url>"
-	idx := strings.Index(transactionJSON, "\"support_url\":\"")
-	if idx == -1 {
-		return "", fmt.Errorf("support_url not found in payload")
-	}
-	start := idx + len("\"support_url\":\"")
-	end := strings.Index(transactionJSON[start:], "\"")
-	if end == -1 {
-		return "", fmt.Errorf("malformed support_url in payload")
-	}
-	supportURL := transactionJSON[start : start+end]
+/*func fetchAndUploadSupportImage(ctx context.Context, transactionJSON string) (string, error) {
+// Extraer support_url del JSON (búsqueda simple para evitar dependencia de structs)
+// Se asume que el campo es: "support_url":"<url>"
+idx := strings.Index(transactionJSON, "\"support_url\":\"")
+if idx == -1 {
+	return "", fmt.Errorf("support_url not found in payload")
+}
+start := idx + len("\"support_url\":\"")
+end := strings.Index(transactionJSON[start:], "\"")
+if end == -1 {
+	return "", fmt.Errorf("malformed support_url in payload")
+}
+supportURL := transactionJSON[start : start+end]
 
-	// Obtener URL real de la imagen desde Graph API
-	realImageURL, err := getRealImageURLFromMeta(ctx, supportURL)
-	if err != nil {
-		log.Printf("Error getting real image URL from Meta: %v", err)
-		return fallbackUpload()
-	}
-
-	// Descargar imagen real con Bearer
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realImageURL, nil)
-	if err != nil {
-		log.Println(err, "error NewRequestWithContext descargando imagen")
-		return fallbackUpload()
-	}
-	if config.C.BearerTokenMeta != "" {
-		req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if resp != nil {
-			resp.Body.Close()
-		}
-		log.Println(err, "error DefaultClient.Do imagen")
-		log.Println(resp.StatusCode, "status code imagen")
-		log.Println(resp.Status, "status imagen")
-		return fallbackUpload()
-	}
-	defer resp.Body.Close()
-
-	// Asegurar que es imagen
-	contentType := resp.Header.Get("Content-Type")
-
-	if contentType == "" {
-		// intentar detectar por algunos bytes
-		peek := make([]byte, 512)
-		n, _ := io.ReadFull(resp.Body, peek)
-		contentType = http.DetectContentType(peek[:n])
-		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek[:n]), resp.Body))
-	}
-	if !strings.HasPrefix(contentType, "image/") {
-		log.Println(contentType, "content type imagen no es image/")
-		return fallbackUpload()
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Println(err, "error ReadAll imagen")
-		return fallbackUpload()
-	}
-
-	// Nombre y extensión
-	ext := ".jpeg"
-	if exts, _ := mime.ExtensionsByType(contentType); len(exts) > 0 {
-		ext = exts[0]
-	}
-	fileName := fmt.Sprintf("evidence_%d%s", time.Now().UnixNano(), ext)
-	log.Println(fileName, "fileName imagen")
-
-	// Subir a Supabase
-	/*url, err := uploadToSupabase(ctx, fileName, data, contentType)
-	if err != nil {
-		log.Println(err, "error uploadToSupabase imagen")
-		return fallbackUpload()
-	}
-	log.Println(url, "url fetchAndUploadSupportImage imagen")*/
-	url := fmt.Sprintf("data:%s;base64,%s", "image/jpeg", base64.StdEncoding.EncodeToString(data))
-	return url, nil
+// Obtener URL real de la imagen desde Graph API
+realImageURL, err := getRealImageURLFromMeta(ctx, supportURL)
+if err != nil {
+	log.Printf("Error getting real image URL from Meta: %v", err)
+	return fallbackUpload()
 }
 
-func fallbackUpload() (string, error) {
+// Descargar imagen real con Bearer
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, realImageURL, nil)
+if err != nil {
+	log.Println(err, "error NewRequestWithContext descargando imagen")
+	return fallbackUpload()
+}
+if config.C.BearerTokenMeta != "" {
+	req.Header.Set("Authorization", "Bearer "+config.C.BearerTokenMeta)
+}
+
+resp, err := http.DefaultClient.Do(req)
+if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp != nil {
+		resp.Body.Close()
+	}
+	log.Println(err, "error DefaultClient.Do imagen")
+	log.Println(resp.StatusCode, "status code imagen")
+	log.Println(resp.Status, "status imagen")
+	return fallbackUpload()
+}
+defer resp.Body.Close()
+
+// Asegurar que es imagen
+contentType := resp.Header.Get("Content-Type")
+
+if contentType == "" {
+	// intentar detectar por algunos bytes
+	peek := make([]byte, 512)
+	n, _ := io.ReadFull(resp.Body, peek)
+	contentType = http.DetectContentType(peek[:n])
+	resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek[:n]), resp.Body))
+}
+if !strings.HasPrefix(contentType, "image/") {
+	log.Println(contentType, "content type imagen no es image/")
+	return fallbackUpload()
+}
+
+data, err := io.ReadAll(resp.Body)
+if err != nil {
+	log.Println(err, "error ReadAll imagen")
+	return fallbackUpload()
+}
+
+// Nombre y extensión
+ext := ".jpeg"
+if exts, _ := mime.ExtensionsByType(contentType); len(exts) > 0 {
+	ext = exts[0]
+}
+fileName := fmt.Sprintf("evidence_%d%s", time.Now().UnixNano(), ext)
+log.Println(fileName, "fileName imagen")
+
+// Subir a Supabase
+/*url, err := uploadToSupabase(ctx, fileName, data, contentType)
+if err != nil {
+	log.Println(err, "error uploadToSupabase imagen")
+	return fallbackUpload()
+}
+log.Println(url, "url fetchAndUploadSupportImage imagen")*/
+// url := fmt.Sprintf("data:%s;base64,%s", "image/jpeg", base64.StdEncoding.EncodeToString(data))
+// return url, nil
+// }*/
+
+/*func fallbackUpload() (string, error) {
 	// Ruta relativa: internal/worker/img/Comprobante-test.jpeg
 	wd, _ := os.Getwd()
 	path := filepath.Join(wd, "internal", "worker", "img", "Comprobante-test.jpeg")
@@ -269,7 +220,7 @@ func fallbackUpload() (string, error) {
 	// uploadToSupabase(ctx, fmt.Sprintf("fallback_%d.jpeg", time.Now().UnixNano()), data, "image/jpeg")
 	url := fmt.Sprintf("data:%s;base64,%s", "image/jpeg", base64.StdEncoding.EncodeToString(data))
 	return url, err
-}
+}*/
 
 /*func uploadToSupabase(ctx context.Context, name string, data []byte, contentType string) (string, error) {
 	if config.C.SupabaseURLProject == "" || config.C.SupabaseBucket == "" || config.C.SupabaseAPIKey == "" {
@@ -303,7 +254,7 @@ func fallbackUpload() (string, error) {
 }*/
 
 // normalizeIdToUnderscoreId convierte el campo "id" a "_id" en el JSON
-func normalizeIdToUnderscoreId(jsonStr string) (string, error) {
+/*func normalizeIdToUnderscoreId(jsonStr string) (string, error) {
 	var txDoc map[string]interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &txDoc); err != nil {
 		return "", err
@@ -338,9 +289,9 @@ func normalizeIdToUnderscoreId(jsonStr string) (string, error) {
 	}
 
 	return string(normalizedBytes), nil
-}
+}*/
 
-func extractIdFromTransactionJSON(transactionJSON string) (string, error) {
+/*func extractIdFromTransactionJSON(transactionJSON string) (string, error) {
 	// Intenta ambos formatos
 	if strings.Contains(transactionJSON, "\"id\":{") {
 		idx := strings.Index(transactionJSON, "\"id\":{")
@@ -365,9 +316,9 @@ func extractIdFromTransactionJSON(transactionJSON string) (string, error) {
 		return "", fmt.Errorf("malformed id")
 	}
 	return transactionJSON[start : start+end], nil
-}
+}*/
 
-func setMongoSupportURL(ctx context.Context, idHex string, uploadedURL string) error {
+/*func setMongoSupportURL(ctx context.Context, idHex string, uploadedURL string) error {
 	oid, err := primitive.ObjectIDFromHex(idHex)
 	if err != nil {
 		return err
@@ -378,7 +329,7 @@ func setMongoSupportURL(ctx context.Context, idHex string, uploadedURL string) e
 		bson.M{"$set": bson.M{"support_url": uploadedURL, "updatedAt": time.Now()}},
 	)
 	return err
-}
+}*/
 
 // extractMidFromWhatsAppURL extrae el parámetro mid de la URL de WhatsApp
 /*func extractMidFromWhatsAppURL(whatsappURL string) (string, error) {
@@ -399,7 +350,7 @@ func setMongoSupportURL(ctx context.Context, idHex string, uploadedURL string) e
 }*/
 
 // getRealImageURLFromMeta obtiene la URL real de la imagen desde Graph API de Meta
-func getRealImageURLFromMeta(ctx context.Context, mid string) (string, error) {
+/*func getRealImageURLFromMeta(ctx context.Context, mid string) (string, error) {
 	// Construir URL de Graph API
 	graphURL := fmt.Sprintf("https://graph.facebook.com/v18.0/%s", mid)
 
@@ -437,4 +388,4 @@ func getRealImageURLFromMeta(ctx context.Context, mid string) (string, error) {
 	}
 
 	return response.URL, nil
-}
+}*/
