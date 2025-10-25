@@ -84,14 +84,50 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 	if raw, ok := message.Values["data"]; ok {
 		originalJSON := fmt.Sprintf("%v", raw)
 
-		// 1) Intentar descargar imagen de Meta y subir a Supabase
+		// 1) Procesar imagen primero (síncrono, no en goroutine)
 		uploadedURL, err := fetchAndUploadSupportImage(ctx, originalJSON)
 		if err != nil {
 			log.Printf("support image handling error: %v", err)
 		}
 
-		// 2) Si tenemos URL subida, actualizar primero en Mongo
-		var finalJSON string = originalJSON
+		// 2) Normalizar el JSON: convertir "id" a "_id" para que el frontend lo reciba correctamente
+		normalizedJSON, err := normalizeIdToUnderscoreId(originalJSON)
+		if err != nil {
+			log.Printf("Error normalizing JSON: %v", err)
+			normalizedJSON = originalJSON // Fallback al original
+		}
+
+		// 3) Parse normalizedJSON back to map to modify it
+		var jsonMap map[string]interface{}
+		if err := json.Unmarshal([]byte(normalizedJSON), &jsonMap); err != nil {
+			log.Printf("Error parsing JSON: %v", err)
+			return
+		}
+
+		// 4) Add support_url to the map if image was uploaded
+		if uploadedURL != "" {
+			jsonMap["support_url"] = uploadedURL
+		}
+
+		// 5) Publicar notificación PENDING al SSE con support_url incluido (ANTES de actualizar MongoDB)
+		// Convertir jsonMap a JSON string para enviarlo correctamente
+		jsonBytes, err := json.Marshal(jsonMap)
+		if err != nil {
+			log.Printf("Error marshaling jsonMap: %v", err)
+			return
+		}
+
+		notification := map[string]interface{}{
+			"type":      "transaction.pending",
+			"data":      string(jsonBytes),
+			"timestamp": time.Now().Unix(),
+		}
+		db.Rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: config.C.RedisNotificationsStream,
+			Values: notification,
+		})
+
+		// 6) Actualizar MongoDB con la URL de imagen DESPUÉS de publicar notificación
 		if uploadedURL != "" {
 			idStr, idErr := extractIdFromTransactionJSON(originalJSON)
 			if idErr != nil {
@@ -99,29 +135,10 @@ func processTransaction(ctx context.Context, message redis.XMessage) {
 			} else {
 				if err := setMongoSupportURL(ctx, idStr, uploadedURL); err != nil {
 					log.Printf("failed to update Mongo support_url: %v", err)
-				} else {
-					// 3) Recargar la transacción desde Mongo y usar ese JSON actualizado para notificar
-					var txDoc map[string]interface{}
-					oid, _ := primitive.ObjectIDFromHex(idStr)
-					if err := db.Mongo().Collection("transactions").FindOne(ctx, bson.M{"_id": oid}).Decode(&txDoc); err == nil {
-						if b, mErr := json.Marshal(txDoc); mErr == nil {
-							finalJSON = string(b)
-						}
-					}
 				}
 			}
 		}
 
-		// 4) Publicar notificación PENDING con el JSON final (ya con support_url de Supabase si se logró subir)
-		notification := map[string]interface{}{
-			"type":      "transaction.pending",
-			"data":      finalJSON,
-			"timestamp": time.Now().Unix(),
-		}
-		db.Rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: config.C.RedisNotificationsStream,
-			Values: notification,
-		})
 		return
 	}
 
@@ -284,6 +301,44 @@ func fallbackUpload() (string, error) {
 	publicURL := fmt.Sprintf("%s/storage/v1/object/public/%s/%s", strings.TrimRight(config.C.SupabaseURLProject, "/"), config.C.SupabaseBucket, name)
 	return publicURL, nil
 }*/
+
+// normalizeIdToUnderscoreId convierte el campo "id" a "_id" en el JSON
+func normalizeIdToUnderscoreId(jsonStr string) (string, error) {
+	var txDoc map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &txDoc); err != nil {
+		return "", err
+	}
+
+	// Extraer el valor del campo "id" si existe
+	if idValue, exists := txDoc["id"]; exists {
+		// Eliminar el campo "id"
+		delete(txDoc, "id")
+
+		// Convertir a string si es necesario
+		var idStr string
+		if idObj, ok := idValue.(map[string]interface{}); ok {
+			// Formato MongoDB extendido: {"id": {"$oid": "..."}}
+			if oid, ok := idObj["$oid"].(string); ok {
+				idStr = oid
+			}
+		} else if str, ok := idValue.(string); ok {
+			idStr = str
+		}
+
+		// Agregar como "_id"
+		if idStr != "" {
+			txDoc["_id"] = idStr
+		}
+	}
+
+	// Serializar de vuelta a JSON
+	normalizedBytes, err := json.Marshal(txDoc)
+	if err != nil {
+		return "", err
+	}
+
+	return string(normalizedBytes), nil
+}
 
 func extractIdFromTransactionJSON(transactionJSON string) (string, error) {
 	// Intenta ambos formatos

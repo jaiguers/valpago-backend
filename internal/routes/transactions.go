@@ -145,8 +145,6 @@ func createTransaction(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Database error"})
 	}
 
-	fmt.Printf("User found: %s (%s)\n", user.Name, user.Email)
-
 	// Mapear de español a inglés
 	req, err := mapSpanishToEnglish(spanishReq, userID)
 	if err != nil {
