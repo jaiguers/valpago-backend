@@ -174,15 +174,6 @@ func createTransaction(c echo.Context) error {
 		UpdatedAt:          time.Now(),
 	}
 
-	// Intentar descargar y procesar la imagen de Meta
-	uploadedURL, err := fetchAndUploadSupportImage(c.Request().Context(), transaction.SupportURL)
-	if err != nil {
-		// Si falla, usar la URL original y solo registrar el error (no bloquear la transacción)
-		log.Printf("Warning: Failed to fetch/upload support image, using original URL: %v", err)
-	} else {
-		transaction.SupportURL = uploadedURL
-	}
-
 	result, err := db.Mongo().Collection("transactions").InsertOne(c.Request().Context(), transaction)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to create transaction"})
@@ -450,16 +441,38 @@ func reviewTransaction(c echo.Context) error {
 	// Actualizar Mongo a REVIEW y cargar objeto para notificar
 	var tx Transaction
 	objID, _ := primitive.ObjectIDFromHex(idStr)
-	if _, err := db.Mongo().Collection("transactions").UpdateOne(
-		ctx,
-		bson.M{"_id": objID},
-		bson.M{"$set": bson.M{"status": "review", "updatedAt": time.Now()}},
-	); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to update transaction in Mongo"})
-	}
+
+	// Primero cargar la transacción para obtener el support_url actual
 	if err := db.Mongo().Collection("transactions").FindOne(ctx, bson.M{"_id": objID}).Decode(&tx); err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to load transaction"})
 	}
+
+	// Intentar descargar y procesar la imagen de Meta
+	uploadedURL, err := fetchAndUploadSupportImage(c.Request().Context(), tx.SupportURL)
+	if err != nil {
+		// Si falla, usar la URL original y solo registrar el error (no bloquear la transacción)
+		log.Printf("Warning: Failed to fetch/upload support image, using original URL: %v", err)
+		uploadedURL = tx.SupportURL // Mantener URL original
+	}
+
+	// Actualizar estado y support_url en MongoDB
+	updateData := bson.M{
+		"status":      "review",
+		"updatedAt":   time.Now(),
+		"support_url": uploadedURL,
+	}
+	if _, err := db.Mongo().Collection("transactions").UpdateOne(
+		ctx,
+		bson.M{"_id": objID},
+		bson.M{"$set": updateData},
+	); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to update transaction in Mongo"})
+	}
+
+	// Actualizar el objeto local para la respuesta
+	tx.Status = "review"
+	tx.SupportURL = uploadedURL
+	tx.UpdatedAt = time.Now()
 	payloadBytes, _ := json.Marshal(tx)
 
 	// Publicar evento de estado al stream de procesamiento para que el worker lo maneje
@@ -476,7 +489,7 @@ func reviewTransaction(c echo.Context) error {
 		db.Rdb.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: stateEvent})
 	}
 
-	return c.JSON(http.StatusOK, map[string]string{"message": "Transaction moved to review"})
+	return c.JSON(http.StatusOK, tx)
 }
 
 // approveTransaction: mueve estado de review -> approved y notifica
